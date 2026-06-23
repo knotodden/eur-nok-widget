@@ -1,0 +1,365 @@
+<!--
+  Nordic currency / NOK reference rate widget — for use on payroll contracts
+  between Velox AS (Norway) and Velox group entities in Denmark, Sweden,
+  Iceland, Finland (EUR) and any GBP-denominated arrangements.
+
+  CURRENCIES
+  Buttons let you switch between EUR, DKK, SEK, ISK and GBP — all quoted
+  against NOK, all from the same Norges Bank dataflow (EXR), fetched in a
+  single API call. ISK is shown as "NOK per 100 ISK" rather than per 1 ISK
+  (matching how Norges Bank and the market itself quote it) — at 2 decimal
+  places, "NOK per 1 ISK" would round away too much precision to be usable
+  for payroll (e.g. 0,08 vs the real 0,0817). EUR/DKK/SEK/GBP are shown per
+  1 unit, which is the normal convention for those.
+
+  LOGIC (unchanged from before, just generalised across currencies)
+  - "Current rate" = frozen average of the N full months before this month
+    started. Stays fixed all month regardless of when it's viewed.
+  - "Projected next month rate" = live rolling average of the N months
+    ending today — a preview only, will keep moving until month-end.
+  - History table below = the same frozen calculation, replayed for the
+    last 12 months, newest first.
+  - Period buttons (1/3/6/12 months) change N. 6 months is marked as the
+    recommended default — Velox's standard averaging period for payroll
+    conversions — but any period can still be selected and viewed.
+  - Nothing is stored: every figure (including history) is recomputed live
+    from Norges Bank's published daily rates each time the page loads, so
+    it can't drift or be edited — see the original build notes for why.
+
+  HOW TO EMBED IN SHAREPOINT
+  SharePoint's Embed web part only accepts an <iframe> pointing at a URL —
+  it does not run pasted HTML/JS directly. Host this file somewhere with
+  its own URL (e.g. GitHub Pages) and embed it with:
+    <iframe src="https://yourusername.github.io/yourrepo/eur-nok-rate-widget.html" width="800" height="800" frameborder="0"></iframe>
+  Remember: if your site's HTML Field Security setting restricts embeddable
+  domains, a Site Collection Administrator needs to add that hosting
+  domain (e.g. yourusername.github.io) via Site Settings → HTML Field
+  Security.
+-->
+<div id="fx-widget" style="
+  font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+  max-width: 640px;
+  border: 1px solid #d8dee5;
+  border-radius: 8px;
+  padding: 20px 24px;
+  background: #ffffff;
+  color: #1a1a1a;
+">
+  <div id="fx-title" style="font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #0047BA;">
+    EUR / NOK reference rate
+  </div>
+
+  <div style="margin-top: 14px;">
+    <div style="font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #8a94a3; margin-bottom: 6px;">Currency</div>
+    <div id="fx-currency-buttons" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+  </div>
+
+  <div style="margin-top: 16px;">
+    <div style="font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #8a94a3; margin-bottom: 6px;">Averaging period</div>
+    <div id="fx-period-buttons" style="display: flex; gap: 6px; flex-wrap: wrap; align-items: center;"></div>
+    <div style="font-size: 12px; color: #009845; margin-top: 6px;">● 6 months is Velox's recommended averaging period for payroll conversions</div>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 14px; margin-top: 18px;">
+    <div>
+      <div id="fx-current-label" style="font-size: 13px; color: #5a6472;">Current rate</div>
+      <div id="fx-current-value" style="font-size: 32px; font-weight: 700; color: #1a1a1a;">Loading…</div>
+    </div>
+    <div>
+      <div id="fx-projected-label" style="font-size: 13px; color: #5a6472;">Projected next month rate</div>
+      <div id="fx-projected-value" style="font-size: 22px; font-weight: 600; color: #009845;">Loading…</div>
+    </div>
+  </div>
+
+  <div style="margin-top: 24px;">
+    <div style="font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #5a6472; margin-bottom: 8px;">
+      Monthly history (newest first)
+    </div>
+    <table id="fx-history" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+      <thead><tr id="fx-history-head"></tr></thead>
+      <tbody id="fx-history-body"><tr><td style="padding: 8px 6px; color: #8a94a3;">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div id="fx-meta" style="font-size: 12px; color: #8a94a3; margin-top: 16px; border-top: 1px solid #eef1f4; padding-top: 10px;">
+    Source: Norges Bank (data.norges-bank.no), series EXR.B.NOK.SP
+  </div>
+</div>
+
+<script>
+(function () {
+  var CURRENCIES = [
+    { code: 'EUR', quoteAs100: false },
+    { code: 'DKK', quoteAs100: false },
+    { code: 'SEK', quoteAs100: false },
+    { code: 'ISK', quoteAs100: true },
+    { code: 'GBP', quoteAs100: false }
+  ];
+  var PERIODS = [1, 3, 6, 12];
+  var RECOMMENDED_PERIOD = 6;
+
+  var selectedCurrency = 'EUR';
+  var selectedPeriod = RECOMMENDED_PERIOD;
+  var HISTORY_MONTHS = 12;
+
+  // observationsByCurrency[code] = [{date: Date, rate: number}, ...] sorted ascending.
+  // rate is always normalised to "NOK per 1 unit of base currency".
+  var observationsByCurrency = {};
+
+  var titleEl = document.getElementById('fx-title');
+  var currencyButtonsEl = document.getElementById('fx-currency-buttons');
+  var periodButtonsEl = document.getElementById('fx-period-buttons');
+  var currentLabelEl = document.getElementById('fx-current-label');
+  var currentValueEl = document.getElementById('fx-current-value');
+  var projectedLabelEl = document.getElementById('fx-projected-label');
+  var projectedValueEl = document.getElementById('fx-projected-value');
+  var metaEl = document.getElementById('fx-meta');
+  var historyHeadEl = document.getElementById('fx-history-head');
+  var historyBodyEl = document.getElementById('fx-history-body');
+
+  var MONTH_NAMES = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  function isoDate(d) { return d.toISOString().slice(0, 10); }
+  function fmtRate(r) { return r.toFixed(2).replace('.', ','); }
+  function fmtDateShort(d) {
+    return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
+  }
+  function addMonths(d, n) { return new Date(d.getFullYear(), d.getMonth() + n, d.getDate()); }
+  function currencyMeta(code) {
+    for (var i = 0; i < CURRENCIES.length; i++) if (CURRENCIES[i].code === code) return CURRENCIES[i];
+    return CURRENCIES[0];
+  }
+
+  function average(observations, fromDate, toDateExclusive) {
+    var sum = 0, count = 0, first = null, last = null;
+    for (var i = 0; i < observations.length; i++) {
+      var o = observations[i];
+      if (o.date >= fromDate && o.date < toDateExclusive) {
+        sum += o.rate; count += 1;
+        if (first === null) first = o.date;
+        last = o.date;
+      }
+    }
+    if (count === 0) return null;
+    return { avg: sum / count, count: count, first: first, last: last };
+  }
+
+  function frozenRate(observations, periodMonths, firstOfMonth) {
+    var start = addMonths(firstOfMonth, -periodMonths);
+    var r = average(observations, start, firstOfMonth);
+    return r ? r.avg : null;
+  }
+
+  // Convert an internal "per 1 unit" rate to the display value/unit label for a currency.
+  function displayValue(code, perUnitRate) {
+    var meta = currencyMeta(code);
+    return meta.quoteAs100 ? perUnitRate * 100 : perUnitRate;
+  }
+  function unitLabel(code) {
+    return currencyMeta(code).quoteAs100 ? ('per 100 ' + code) : ('per 1 ' + code);
+  }
+
+  function renderCards() {
+    var observations = observationsByCurrency[selectedCurrency] || [];
+    var today = new Date();
+    var firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+    var thisMonthName = MONTH_NAMES[today.getMonth()] + ' ' + today.getFullYear();
+    var nextMonthDate = addMonths(firstOfThisMonth, 1);
+    var nextMonthName = MONTH_NAMES[nextMonthDate.getMonth()] + ' ' + nextMonthDate.getFullYear();
+
+    var currentAvg = frozenRate(observations, selectedPeriod, firstOfThisMonth);
+
+    var projectedWindowStart = addMonths(today, -selectedPeriod);
+    var projectedWindowEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+    var projectedResult = average(observations, projectedWindowStart, projectedWindowEnd);
+
+    titleEl.textContent = selectedCurrency + ' / NOK reference rate (' + unitLabel(selectedCurrency) + ')';
+    currentLabelEl.textContent = 'Fixed for ' + thisMonthName + ' \u2014 ' + selectedPeriod + 'm average';
+    projectedLabelEl.textContent = 'Live preview for ' + nextMonthName + ' \u2014 ' + selectedPeriod + 'm average';
+
+    currentValueEl.textContent = currentAvg !== null
+      ? ('Current rate: ' + fmtRate(displayValue(selectedCurrency, currentAvg)))
+      : 'Current rate: unavailable';
+    projectedValueEl.textContent = projectedResult
+      ? ('Projected next month rate: ' + fmtRate(displayValue(selectedCurrency, projectedResult.avg)))
+      : 'Projected next month rate: unavailable';
+
+    var metaParts = [];
+    if (projectedResult) {
+      metaParts.push('Live window: ' + fmtDateShort(projectedResult.first) + ' \u2013 ' + fmtDateShort(projectedResult.last) + ' (' + projectedResult.count + ' daily rates)');
+    }
+    metaParts.push('Source: Norges Bank, series EXR.B.' + selectedCurrency + '.NOK.SP');
+    metaParts.push('Fetched ' + fmtDateShort(today) + ' ' + today.toTimeString().slice(0,5));
+    metaEl.textContent = metaParts.join(' \u2014 ');
+  }
+
+  function renderHistory() {
+    var observations = observationsByCurrency[selectedCurrency] || [];
+
+    historyHeadEl.innerHTML = '';
+    var thMonth = document.createElement('th');
+    thMonth.textContent = 'Month';
+    thMonth.style.cssText = 'text-align:left; padding:8px 6px; border-bottom:1px solid #eef1f4; color:#5a6472; font-weight:600;';
+    historyHeadEl.appendChild(thMonth);
+
+    PERIODS.forEach(function (p) {
+      var th = document.createElement('th');
+      th.textContent = p + 'm' + (p === RECOMMENDED_PERIOD ? ' \u2605' : '');
+      var active = p === selectedPeriod;
+      th.style.cssText = 'text-align:right; padding:8px 6px; border-bottom:1px solid #eef1f4; font-weight:600; '
+        + (active ? 'color:#0047BA; background:#eef3fb;' : 'color:#5a6472;');
+      historyHeadEl.appendChild(th);
+    });
+
+    historyBodyEl.innerHTML = '';
+    var today = new Date();
+    var firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+
+    for (var m = 0; m < HISTORY_MONTHS; m++) {
+      var monthStart = addMonths(firstOfThisMonth, -m);
+      var label = MONTH_NAMES[monthStart.getMonth()] + ' ' + monthStart.getFullYear();
+      var row = document.createElement('tr');
+      if (m === 0) row.style.background = '#fbfbfc';
+
+      var tdMonth = document.createElement('td');
+      tdMonth.textContent = label + (m === 0 ? ' (current)' : '');
+      tdMonth.style.cssText = 'padding:8px 6px; border-bottom:1px solid #f4f5f7;' + (m === 0 ? ' font-weight:600;' : '');
+      row.appendChild(tdMonth);
+
+      PERIODS.forEach(function (p) {
+        var val = frozenRate(observations, p, monthStart);
+        var td = document.createElement('td');
+        td.textContent = val !== null ? fmtRate(displayValue(selectedCurrency, val)) : '\u2014';
+        var active = p === selectedPeriod;
+        td.style.cssText = 'text-align:right; padding:8px 6px; border-bottom:1px solid #f4f5f7; font-variant-numeric: tabular-nums;'
+          + (active ? ' background:#eef3fb; color:#0047BA;' : '')
+          + (m === 0 && active ? ' font-weight:700;' : '');
+        row.appendChild(td);
+      });
+
+      historyBodyEl.appendChild(row);
+    }
+  }
+
+  function renderAll() {
+    renderCards();
+    renderHistory();
+  }
+
+  function buttonStyle(active) {
+    return 'padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer;'
+      + (active
+        ? ' background: #0047BA; color: #ffffff; border: 1px solid #0047BA;'
+        : ' background: #ffffff; color: #0047BA; border: 1px solid #c7d2e0;');
+  }
+
+  function buildCurrencyButtons() {
+    currencyButtonsEl.innerHTML = '';
+    CURRENCIES.forEach(function (c) {
+      var btn = document.createElement('button');
+      btn.textContent = c.code;
+      btn.setAttribute('data-currency', c.code);
+      btn.style.cssText = buttonStyle(c.code === selectedCurrency);
+      btn.onclick = function () {
+        selectedCurrency = c.code;
+        Array.prototype.forEach.call(currencyButtonsEl.children, function (b) {
+          b.style.cssText = buttonStyle(b.getAttribute('data-currency') === selectedCurrency);
+        });
+        renderAll();
+      };
+      currencyButtonsEl.appendChild(btn);
+    });
+  }
+
+  function buildPeriodButtons() {
+    periodButtonsEl.innerHTML = '';
+    PERIODS.forEach(function (p) {
+      var btn = document.createElement('button');
+      btn.textContent = p + 'm' + (p === RECOMMENDED_PERIOD ? ' \u2605' : '');
+      btn.title = p === RECOMMENDED_PERIOD ? 'Recommended period' : '';
+      btn.setAttribute('data-period', p);
+      btn.style.cssText = buttonStyle(p === selectedPeriod);
+      btn.onclick = function () {
+        selectedPeriod = p;
+        Array.prototype.forEach.call(periodButtonsEl.children, function (b) {
+          b.style.cssText = buttonStyle(parseInt(b.getAttribute('data-period'), 10) === selectedPeriod);
+        });
+        renderAll();
+      };
+      periodButtonsEl.appendChild(btn);
+    });
+  }
+
+  buildCurrencyButtons();
+  buildPeriodButtons();
+
+  var todayForFetch = new Date();
+  var fetchStart = addMonths(todayForFetch, -(HISTORY_MONTHS + 12 + 1));
+  var currencyKeys = CURRENCIES.map(function (c) { return c.code; }).join('+');
+  var url = 'https://data.norges-bank.no/api/data/EXR/B.' + currencyKeys + '.NOK.SP'
+    + '?format=sdmx-json&startPeriod=' + isoDate(fetchStart) + '&endPeriod=' + isoDate(todayForFetch)
+    + '&locale=en';
+
+  fetch(url)
+    .then(function (res) {
+      if (!res.ok) throw new Error('Norges Bank API returned ' + res.status);
+      return res.json();
+    })
+    .then(function (data) {
+      var seriesDims = data.data.structure.dimensions.series; // [FREQ, BASE_CUR, QUOTE_CUR, TENOR]
+      var attrDims = data.data.structure.attributes.series;   // [DECIMALS, CALCULATED, UNIT_MULT, COLLECTION] (order may vary)
+      var timeValues = data.data.structure.dimensions.observation[0].values;
+
+      var baseCurDimIndex = -1, baseCurValues = null;
+      seriesDims.forEach(function (d, idx) {
+        if (d.id === 'BASE_CUR') { baseCurDimIndex = idx; baseCurValues = d.values; }
+      });
+
+      var unitMultAttrIndex = -1, unitMultValues = null;
+      attrDims.forEach(function (d, idx) {
+        if (d.id === 'UNIT_MULT') { unitMultAttrIndex = idx; unitMultValues = d.values; }
+      });
+
+      var allSeries = data.data.dataSets[0].series;
+      observationsByCurrency = {};
+
+      Object.keys(allSeries).forEach(function (seriesKey) {
+        var seriesObj = allSeries[seriesKey];
+        var keyParts = seriesKey.split(':').map(function (s) { return parseInt(s, 10); });
+
+        var baseCurId = (baseCurDimIndex >= 0 && baseCurValues)
+          ? baseCurValues[keyParts[baseCurDimIndex]].id
+          : null;
+        if (!baseCurId) return;
+
+        var divisor = 1;
+        if (unitMultAttrIndex >= 0 && unitMultValues && seriesObj.attributes) {
+          var unitMultValueIndex = seriesObj.attributes[unitMultAttrIndex];
+          var unitMultId = unitMultValues[unitMultValueIndex] ? unitMultValues[unitMultValueIndex].id : '0';
+          divisor = Math.pow(10, parseInt(unitMultId, 10) || 0);
+        }
+
+        var obsList = Object.keys(seriesObj.observations).map(function (key) {
+          var raw = parseFloat(seriesObj.observations[key][0]);
+          var periodLabel = timeValues[parseInt(key, 10)].id;
+          return { date: new Date(periodLabel), rate: raw / divisor };
+        }).filter(function (o) { return !isNaN(o.rate); })
+          .sort(function (a, b) { return a.date - b.date; });
+
+        observationsByCurrency[baseCurId] = obsList;
+      });
+
+      renderAll();
+    })
+    .catch(function (err) {
+      currentValueEl.textContent = 'Rate unavailable';
+      currentValueEl.style.color = '#b3261e';
+      projectedValueEl.textContent = 'Rate unavailable';
+      projectedValueEl.style.color = '#b3261e';
+      historyBodyEl.innerHTML = '<tr><td style="padding:8px 6px; color:#b3261e;">Could not load history.</td></tr>';
+      metaEl.textContent = 'Could not reach Norges Bank: ' + err.message
+        + '. Check that this network/tenant allows requests to data.norges-bank.no.';
+    });
+})();
+</script>
