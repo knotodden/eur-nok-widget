@@ -1,0 +1,290 @@
+<!--
+  EUR/NOK Conversion Rate Widget — for use on payroll contracts between
+  Velox AS (Norway) and Velox Electro Nordics Oy (Finland)
+
+  ON THE HISTORY LIST (read this before you trust it for audits)
+  This does NOT store anything in a database or SharePoint list. Instead,
+  every time the page loads, it RECOMPUTES what the frozen "Current rate"
+  would have been for each of the last 12 months, straight from Norges
+  Bank's published daily history, using the exact same freeze rule each
+  time: average of the N months immediately before that month started.
+  That is deliberate, not a shortcut:
+  - A widget embedded via SharePoint's "Embed" web part runs in a
+    sandboxed iframe on a different origin, with no logged-in SharePoint
+    context — so it cannot write to a SharePoint list directly without
+    extra plumbing (a Power Automate HTTP-trigger flow acting as a proxy,
+    or a proper SPFx web part). Neither was in scope here.
+  - More importantly: because the figure is a pure function of Norges
+    Bank's own immutable published rates, it is reproducible by anyone,
+    at any time, from the source of truth — which is arguably stronger
+    for audit purposes than a manually-maintained log that could in
+    principle be edited.
+  - Caveat: Norges Bank can occasionally issue a correction to a
+    previously published daily rate (rare). If that ever happens, the
+    recomputed figure for that month would change to match. If you need
+    a literally immutable record of what was actually used on a given
+    payroll date regardless of any later correction, that does need a
+    real write-once store (SharePoint list via Power Automate, or
+    similar) — say so and this can be extended.
+
+  LOGIC
+  - "Current rate" = frozen average of the N full months before this
+    month started. Stays fixed all month regardless of when it's viewed.
+  - "Projected next month rate" = live rolling average of the N months
+    ending today — a preview only, will keep moving until month-end.
+  - History table below = the same frozen calculation, replayed for the
+    last 12 months, newest first.
+  - Buttons (1/3/6/12) change N for the cards AND highlight the matching
+    column in the history table. All four periods are always computed
+    and shown in the table regardless of which button is active.
+  - Data source: Norges Bank open data API (data.norges-bank.no),
+    series EXR.B.EUR.NOK.SP — daily official EUR/NOK reference rate.
+
+  HOW TO EMBED IN SHAREPOINT
+  1. Edit the page → add the "Embed" web part.
+  2. Paste this entire file's contents into the embed code box.
+  3. Publish.
+
+  BEFORE YOU RELY ON THIS
+  - Confirm your tenant's network allows outbound calls from the embed
+    to data.norges-bank.no — test on the live page.
+-->
+<div id="eurnok-widget" style="
+  font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+  max-width: 620px;
+  border: 1px solid #d8dee5;
+  border-radius: 8px;
+  padding: 20px 24px;
+  background: #ffffff;
+  color: #1a1a1a;
+">
+  <div style="font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #0047BA;">
+    EUR / NOK reference rate
+  </div>
+
+  <div id="eurnok-buttons" style="display: flex; gap: 6px; margin: 14px 0 18px;"></div>
+
+  <div style="display: flex; flex-direction: column; gap: 14px;">
+    <div>
+      <div id="eurnok-current-label" style="font-size: 13px; color: #5a6472;">Current rate</div>
+      <div id="eurnok-current-value" style="font-size: 32px; font-weight: 700; color: #1a1a1a;">Loading…</div>
+    </div>
+    <div>
+      <div id="eurnok-projected-label" style="font-size: 13px; color: #5a6472;">Projected next month rate</div>
+      <div id="eurnok-projected-value" style="font-size: 22px; font-weight: 600; color: #009845;">Loading…</div>
+    </div>
+  </div>
+
+  <div style="margin-top: 24px;">
+    <div style="font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #5a6472; margin-bottom: 8px;">
+      Monthly history (newest first)
+    </div>
+    <table id="eurnok-history" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+      <thead>
+        <tr id="eurnok-history-head"></tr>
+      </thead>
+      <tbody id="eurnok-history-body">
+        <tr><td style="padding: 8px 6px; color: #8a94a3;">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="eurnok-meta" style="font-size: 12px; color: #8a94a3; margin-top: 16px; border-top: 1px solid #eef1f4; padding-top: 10px;">
+    Source: Norges Bank (data.norges-bank.no), series EXR.B.EUR.NOK.SP
+  </div>
+</div>
+
+<script>
+(function () {
+  var PERIODS = [1, 3, 6, 12];
+  var selectedPeriod = 6; // default
+  var HISTORY_MONTHS = 12;
+  var observations = []; // {date: Date, rate: number}, sorted ascending
+
+  var buttonsEl = document.getElementById('eurnok-buttons');
+  var currentLabelEl = document.getElementById('eurnok-current-label');
+  var currentValueEl = document.getElementById('eurnok-current-value');
+  var projectedLabelEl = document.getElementById('eurnok-projected-label');
+  var projectedValueEl = document.getElementById('eurnok-projected-value');
+  var metaEl = document.getElementById('eurnok-meta');
+  var historyHeadEl = document.getElementById('eurnok-history-head');
+  var historyBodyEl = document.getElementById('eurnok-history-body');
+
+  var MONTH_NAMES = ['January','February','March','April','May','June',
+    'July','August','September','October','November','December'];
+
+  function isoDate(d) { return d.toISOString().slice(0, 10); }
+  function fmtRate(r) { return r.toFixed(2).replace('.', ','); }
+  function fmtDateShort(d) {
+    return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear();
+  }
+  function addMonths(d, n) { return new Date(d.getFullYear(), d.getMonth() + n, d.getDate()); }
+
+  function average(fromDate, toDateExclusive) {
+    var sum = 0, count = 0, first = null, last = null;
+    for (var i = 0; i < observations.length; i++) {
+      var o = observations[i];
+      if (o.date >= fromDate && o.date < toDateExclusive) {
+        sum += o.rate; count += 1;
+        if (first === null) first = o.date;
+        last = o.date;
+      }
+    }
+    if (count === 0) return null;
+    return { avg: sum / count, count: count, first: first, last: last };
+  }
+
+  // Frozen rate for a given period as of a given "first of month" date.
+  function frozenRate(periodMonths, firstOfMonth) {
+    var start = addMonths(firstOfMonth, -periodMonths);
+    var r = average(start, firstOfMonth);
+    return r ? r.avg : null;
+  }
+
+  function renderCards() {
+    var today = new Date();
+    var firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+    var thisMonthName = MONTH_NAMES[today.getMonth()] + ' ' + today.getFullYear();
+    var nextMonthDate = addMonths(firstOfThisMonth, 1);
+    var nextMonthName = MONTH_NAMES[nextMonthDate.getMonth()] + ' ' + nextMonthDate.getFullYear();
+
+    var currentAvg = frozenRate(selectedPeriod, firstOfThisMonth);
+
+    var projectedWindowStart = addMonths(today, -selectedPeriod);
+    var projectedWindowEnd = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+    var projectedResult = average(projectedWindowStart, projectedWindowEnd);
+
+    currentLabelEl.textContent = 'Fixed for ' + thisMonthName + ' \u2014 ' + selectedPeriod + 'm average';
+    projectedLabelEl.textContent = 'Live preview for ' + nextMonthName + ' \u2014 ' + selectedPeriod + 'm average';
+
+    currentValueEl.textContent = currentAvg !== null ? ('Current rate: ' + fmtRate(currentAvg)) : 'Current rate: unavailable';
+    projectedValueEl.textContent = projectedResult ? ('Projected next month rate: ' + fmtRate(projectedResult.avg)) : 'Projected next month rate: unavailable';
+
+    var metaParts = [];
+    if (projectedResult) {
+      metaParts.push('Live window: ' + fmtDateShort(projectedResult.first) + ' \u2013 ' + fmtDateShort(projectedResult.last) + ' (' + projectedResult.count + ' daily rates)');
+    }
+    metaParts.push('Source: Norges Bank, series EXR.B.EUR.NOK.SP');
+    metaParts.push('Fetched ' + fmtDateShort(today) + ' ' + today.toTimeString().slice(0,5));
+    metaEl.textContent = metaParts.join(' \u2014 ');
+  }
+
+  function renderHistory() {
+    // Header row
+    historyHeadEl.innerHTML = '';
+    var thMonth = document.createElement('th');
+    thMonth.textContent = 'Month';
+    thMonth.style.cssText = 'text-align:left; padding:8px 6px; border-bottom:1px solid #eef1f4; color:#5a6472; font-weight:600;';
+    historyHeadEl.appendChild(thMonth);
+
+    PERIODS.forEach(function (p) {
+      var th = document.createElement('th');
+      th.textContent = p + 'm';
+      var active = p === selectedPeriod;
+      th.style.cssText = 'text-align:right; padding:8px 6px; border-bottom:1px solid #eef1f4; font-weight:600; '
+        + (active ? 'color:#0047BA; background:#eef3fb;' : 'color:#5a6472;');
+      historyHeadEl.appendChild(th);
+    });
+
+    // Body rows: this month back HISTORY_MONTHS-1 more months, newest first
+    historyBodyEl.innerHTML = '';
+    var today = new Date();
+    var firstOfThisMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+
+    for (var m = 0; m < HISTORY_MONTHS; m++) {
+      var monthStart = addMonths(firstOfThisMonth, -m);
+      var label = MONTH_NAMES[monthStart.getMonth()] + ' ' + monthStart.getFullYear();
+      var row = document.createElement('tr');
+      if (m === 0) row.style.background = '#fbfbfc';
+
+      var tdMonth = document.createElement('td');
+      tdMonth.textContent = label + (m === 0 ? ' (current)' : '');
+      tdMonth.style.cssText = 'padding:8px 6px; border-bottom:1px solid #f4f5f7;' + (m === 0 ? ' font-weight:600;' : '');
+      row.appendChild(tdMonth);
+
+      PERIODS.forEach(function (p) {
+        var val = frozenRate(p, monthStart);
+        var td = document.createElement('td');
+        td.textContent = val !== null ? fmtRate(val) : '\u2014';
+        var active = p === selectedPeriod;
+        td.style.cssText = 'text-align:right; padding:8px 6px; border-bottom:1px solid #f4f5f7; font-variant-numeric: tabular-nums;'
+          + (active ? ' background:#eef3fb; color:#0047BA;' : '')
+          + (m === 0 && active ? ' font-weight:700;' : '');
+        row.appendChild(td);
+      });
+
+      historyBodyEl.appendChild(row);
+    }
+  }
+
+  function renderAll() {
+    renderCards();
+    renderHistory();
+  }
+
+  function buttonStyle(active) {
+    return 'padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer;'
+      + (active
+        ? ' background: #0047BA; color: #ffffff; border: 1px solid #0047BA;'
+        : ' background: #ffffff; color: #0047BA; border: 1px solid #c7d2e0;');
+  }
+
+  function buildButtons() {
+    buttonsEl.innerHTML = '';
+    PERIODS.forEach(function (p) {
+      var btn = document.createElement('button');
+      btn.textContent = p + 'm';
+      btn.setAttribute('data-period', p);
+      btn.style.cssText = buttonStyle(p === selectedPeriod);
+      btn.onclick = function () {
+        selectedPeriod = p;
+        Array.prototype.forEach.call(buttonsEl.children, function (b) {
+          b.style.cssText = buttonStyle(parseInt(b.getAttribute('data-period'), 10) === selectedPeriod);
+        });
+        renderAll();
+      };
+      buttonsEl.appendChild(btn);
+    });
+  }
+
+  buildButtons();
+
+  var todayForFetch = new Date();
+  // Need HISTORY_MONTHS of history, each requiring up to 12 months lookback, plus buffer.
+  var fetchStart = addMonths(todayForFetch, -(HISTORY_MONTHS + 12 + 1));
+  var url = 'https://data.norges-bank.no/api/data/EXR/B.EUR.NOK.SP'
+    + '?format=sdmx-json&startPeriod=' + isoDate(fetchStart) + '&endPeriod=' + isoDate(todayForFetch)
+    + '&locale=en';
+
+  fetch(url)
+    .then(function (res) {
+      if (!res.ok) throw new Error('Norges Bank API returned ' + res.status);
+      return res.json();
+    })
+    .then(function (data) {
+      var series = data.data.dataSets[0].series['0:0:0:0'];
+      var timeValues = data.data.structure.dimensions.observation[0].values;
+      var rawObs = series.observations;
+
+      observations = Object.keys(rawObs).map(function (key) {
+        var rate = parseFloat(rawObs[key][0]);
+        var periodLabel = timeValues[parseInt(key, 10)].id;
+        return { date: new Date(periodLabel), rate: rate };
+      }).filter(function (o) { return !isNaN(o.rate); })
+        .sort(function (a, b) { return a.date - b.date; });
+
+      if (observations.length === 0) throw new Error('No observations returned');
+
+      renderAll();
+    })
+    .catch(function (err) {
+      currentValueEl.textContent = 'Rate unavailable';
+      currentValueEl.style.color = '#b3261e';
+      projectedValueEl.textContent = 'Rate unavailable';
+      projectedValueEl.style.color = '#b3261e';
+      historyBodyEl.innerHTML = '<tr><td style="padding:8px 6px; color:#b3261e;">Could not load history.</td></tr>';
+      metaEl.textContent = 'Could not reach Norges Bank: ' + err.message
+        + '. Check that this network/tenant allows requests to data.norges-bank.no.';
+    });
+})();
+</script>
